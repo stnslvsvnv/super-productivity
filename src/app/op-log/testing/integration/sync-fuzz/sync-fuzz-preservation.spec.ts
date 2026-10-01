@@ -18,11 +18,13 @@ const entry = (device: string, clock: VectorClock, intent: Intent): LedgerEntry 
       ? [{ entity: `task:${intent[1]}`, field: 'title', value: intent[2] }]
       : intent[0] === 'editTaskNotes'
         ? [{ entity: `task:${intent[1]}`, field: 'notes', value: intent[2] }]
-        : intent[0] === 'editNote'
-          ? [{ entity: `note:${intent[1]}`, field: intent[2], value: intent[3] }]
-          : intent[0] === 'editHabit'
-            ? [{ entity: `habit:${intent[1]}`, field: intent[2], value: intent[3] }]
-            : [];
+        : intent[0] === 'doneTask'
+          ? [{ entity: `task:${intent[1]}`, field: 'isDone', value: intent[2] }]
+          : intent[0] === 'editNote'
+            ? [{ entity: `note:${intent[1]}`, field: intent[2], value: intent[3] }]
+            : intent[0] === 'editHabit'
+              ? [{ entity: `habit:${intent[1]}`, field: intent[2], value: intent[3] }]
+              : [];
   return {
     intent,
     writes,
@@ -126,6 +128,35 @@ describe('sync fuzz preservation oracles', () => {
       ]);
     });
 
+    it('leaves a field to whole-entity LWW when a crossing write comes from tracking', () => {
+      // A's latest isDone comes from tracking, which reopens the task.
+      const doneB = entry('B', { B: 1 }, ['doneTask', 't1', true]);
+      const reopen: LedgerEntry = {
+        ...entry('A', { A: 1 }, ['track', 't1', 1000]),
+        writes: [{ entity: 'task:t1', field: 'isDone', value: false }],
+      };
+      const converged = {
+        tasks: {
+          t1: { id: 't1', isDone: true, timeSpentOnDay: { [fuzzDay()]: 1000 } },
+        },
+      };
+      expect(signatures(converged, [doneB, reopen])).toEqual([]);
+      // ...and when the latest write's device tracks after it, so its side
+      // carries a remote delta for C: C's older notes may win whole-entity.
+      const notesC = entry('C', { C: 1 }, ['editTaskNotes', 't1', 'C notes']);
+      const notesA = entry('A', { A: 1 }, ['editTaskNotes', 't1', 'A notes']);
+      const trackAfter = entry('A', { A: 2 }, ['track', 't1', 1000]);
+      const olderWins = {
+        tasks: {
+          t1: { id: 't1', notes: 'C notes', timeSpentOnDay: { [fuzzDay()]: 1000 } },
+        },
+      };
+      expect(signatures(olderWins, [notesC, notesA, trackAfter])).toEqual([]);
+      expect(signatures(olderWins, [notesC, notesA])).toEqual([
+        'older-write-won:task.notes',
+      ]);
+    });
+
     it('leaves notes and habit counts to whole-entity LWW', () => {
       const lockA = entry('A', { A: 1 }, ['editNote', 'n1', 'isLock', true]);
       const lockC = entry('C', { C: 1 }, ['editNote', 'n1', 'isLock', false]);
@@ -179,19 +210,24 @@ describe('sync fuzz preservation oracles', () => {
   });
 
   describe('deleted tasks', () => {
-    it('checks a deleted task that came back', () => {
+    it('leaves a deleted task that came back to the whole-entity delete-vs-edit win', () => {
       const rename = entry('A', { A: 1 }, ['renameTask', 't1', 'renamed']);
       const del = entry('B', { B: 1 }, ['deleteTask', 't1']);
       expect(signatures({}, [rename, del])).toEqual([]);
       expect(
         signatures({ tasks: { t1: { id: 't1', title: 'old' } } }, [rename, del]),
-      ).toEqual(['field-reverted:task.title']);
+      ).toEqual([]);
+      // ...while the same task without the delete is checked.
+      expect(signatures({ tasks: { t1: { id: 't1', title: 'old' } } }, [rename])).toEqual(
+        ['field-reverted:task.title'],
+      );
     });
   });
 
   describe('replacement content', () => {
     const replacement = (title: string): Replacement => ({
       clock: { fuzzDevA: 5 },
+      clientId: 'fuzzDevA',
       entities: new Set(['task:t1']),
       time: new Map([['task:t1', 0]]),
       fields: new Map<string, unknown>([

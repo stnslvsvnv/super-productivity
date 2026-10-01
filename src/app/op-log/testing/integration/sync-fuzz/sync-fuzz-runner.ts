@@ -245,6 +245,8 @@ export class Ledger {
  */
 export interface Replacement {
   clock: VectorClock;
+  /** The client that created it. */
+  clientId: string;
   entities: Set<string>;
   time: Map<string, number>;
   /**
@@ -296,12 +298,25 @@ const lastReplacement = (harness: SyncFuzzHarness): Replacement | undefined => {
     add(`habit:${id}`, habit as unknown as Record<string, unknown>);
     fields.set(`habit:${id}|countOnDay.${day}`, habit.countOnDay?.[day]);
   }
-  return { clock: row.op.vectorClock, entities, time, fields };
+  return { clock: row.op.vectorClock, clientId: row.op.clientId, entities, time, fields };
 };
 
-const isAtOrAfter = (clock: VectorClock, replacement: VectorClock): boolean => {
-  const comparison = compareVectorClocks(clock, replacement);
-  return comparison === 'GREATER_THAN' || comparison === 'EQUAL';
+/**
+ * Whether the replacement keeps the intent: rule 7's contract as
+ * SyncImportFilterService documents it (classifyOpAgainstSyncImport). An op
+ * at or after the replacement's clock is kept, and so is a CONCURRENT one
+ * that provably saw it: a later op of the replacing client, or one whose
+ * clock holds the replacing client's counter (a receiver resets its clock to
+ * that entry and its own).
+ */
+const isKeptBy = (entry: LedgerEntry, replacement: Replacement): boolean => {
+  const comparison = compareVectorClocks(entry.clock, replacement.clock);
+  if (comparison === 'GREATER_THAN' || comparison === 'EQUAL') return true;
+  if (comparison !== 'CONCURRENT') return false;
+  const importCounter = replacement.clock[replacement.clientId] ?? 0;
+  return entry.clientId === replacement.clientId
+    ? (entry.clock[entry.clientId] ?? 0) > importCounter
+    : importCounter > 0 && (entry.clock[replacement.clientId] ?? 0) >= importCounter;
 };
 
 const valueAt = (source: unknown, path: string[]): unknown =>
@@ -699,9 +714,7 @@ export const runFuzz = async (options: FuzzOptions): Promise<FuzzResult> => {
     reference,
     new Ledger(
       entries.filter(
-        (entry) =>
-          !entry.discarded &&
-          (!replacement || isAtOrAfter(entry.clock, replacement.clock)),
+        (entry) => !entry.discarded && (!replacement || isKeptBy(entry, replacement)),
       ),
     ),
     replacement,
@@ -859,7 +872,12 @@ const checkTodayNotes = (
  * Preservation of what the kept intents and the last replacement wrote.
  *
  * Kept out, by design:
- * - a deleted entity that is gone (`lost-entity`, time and fields);
+ * - a deleted entity (`lost-entity`, time and fields). One exists afterwards
+ *   only when its delete crossed a concurrent edit and lost: delete-vs-edit
+ *   resolves whole-entity, recreating it from the winning side's ops
+ *   (decision 2 of docs/sync-and-op-log/lww-field-level-resolution.md), so
+ *   which earlier writes and time it carries depends on that side, which the
+ *   ledger cannot tell. Its losses stay with #10380 and #10381's pins;
  * - what an edit or a tracked delta wrote while crossing an archive of its
  *   task: the archive wins (sync-core's planner);
  * - in the latest-write check below, the shapes LWW does not promise per
@@ -898,7 +916,7 @@ export const checkPreservation = (
     ...(replacement?.time.keys() ?? []),
   ]);
   for (const entity of trackedTasks) {
-    if (ledger.deleted.has(entity) && !entityOf(entity)) continue;
+    if (ledger.deleted.has(entity)) continue;
     const tracked = ledger.trackedTime(entity);
     const expected = (replacement?.time.get(entity) ?? 0) + (tracked ?? 0);
     if (tracked === undefined && expected === 0) continue;
@@ -914,6 +932,7 @@ export const checkPreservation = (
   for (const [key, value] of replacement?.fields ?? []) {
     if (ledger.writes.has(key)) continue;
     const [entity, field] = key.split('|');
+    if (ledger.deleted.has(entity)) continue;
     const current = entityOf(entity);
     if (!current) continue;
     const actual = valueAt(current, field.split('.'));
@@ -927,6 +946,7 @@ export const checkPreservation = (
 
   for (const [key, allWrites] of ledger.writes) {
     const [entity, field] = key.split('|');
+    if (ledger.deleted.has(entity)) continue;
     const current = entityOf(entity);
     if (!current) continue;
     const writes = allWrites.filter(({ entry }) => !ledger.crossesArchive(entity, entry));
@@ -975,8 +995,9 @@ export const checkPreservation = (
  * - NOTE fields: notes stay on whole-entity LWW (decision 4 of
  *   docs/sync-and-op-log/lww-field-level-resolution.md);
  * - habit counts (`countOnDay`): opaque ops (decision 6);
- * - a field whose latest write crosses an intent in WHOLE_ENTITY_INTENTS on
- *   the same entity: that crossing resolves whole-entity;
+ * - a crossing with an intent in WHOLE_ENTITY_INTENTS on the same entity:
+ *   the latest write or a write concurrent with it comes from one, or one is
+ *   concurrent with either. That crossing resolves whole-entity;
  * - the side-level winner: a field both sides of one conflict wrote takes the
  *   winning side's value, and a side wins by its latest op on the entity
  *   (design A, "Overlap"). So an older write is accepted when its device's
@@ -996,9 +1017,15 @@ const checkLatestWrite = (
   if (type === 'note' || field.startsWith('countOnDay')) return;
   const latest = writes.reduce((a, b) => (isLaterWrite(b.entry, a.entry) ? b : a));
   if (Object.is(actual, latest.value)) return;
+  const crossing = [
+    latest.entry,
+    ...writes.map((w) => w.entry).filter((e) => isConcurrent(e, latest.entry)),
+  ];
   if (
     (ledger.byEntity.get(entity) ?? []).some(
-      (e) => WHOLE_ENTITY_INTENTS.has(e.intent[0]) && isConcurrent(e, latest.entry),
+      (e) =>
+        WHOLE_ENTITY_INTENTS.has(e.intent[0]) &&
+        crossing.some((c) => c === e || isConcurrent(e, c)),
     )
   ) {
     return;
