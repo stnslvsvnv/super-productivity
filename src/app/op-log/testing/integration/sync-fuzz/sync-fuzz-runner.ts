@@ -140,8 +140,8 @@ interface LedgerWrite {
  * with one can carry any value its winning side held:
  * - `track`: `planTasksForToday` is opaque (decision 6 of
  *   docs/sync-and-op-log/lww-field-level-resolution.md), and a remote
- *   `syncTimeSpent` refuses the field patch (an accepted residual, pinned
- *   under #10260);
+ *   `syncTimeSpent` refuses the field patch ("A winner that also tracks
+ *   time" in the design note's residuals: open, pinned under #10260);
  * - `countHabit`: habit counts are opaque (decision 6);
  * - deletes, archives and restores: no field patch reads them, and an
  *   archive wins over a concurrent edit (sync-core's planner).
