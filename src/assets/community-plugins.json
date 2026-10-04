@@ -182,5 +182,13 @@
     "author": "BigWebstas",
     "authorUrl": "https://github.com/BigWebstas",
     "stars": 0
+  },
+  {
+    "name": "Task ID",
+    "shortDescription": "Shows the ID of the selected task and copies it, so you can address that exact task over the local REST API (GET/PATCH/DELETE /tasks/:id).",
+    "url": "https://github.com/stnslvsvnv/super-productivity-task-id",
+    "author": "stnslvsvnv",
+    "authorUrl": "https://github.com/stnslvsvnv",
+    "stars": 0
   }
 ]
